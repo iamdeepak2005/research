@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+
+# Generated data files
+telemetry_data.csv
+telemetry_latest.json
+model.joblib
+simulation_output.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
