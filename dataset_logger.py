@@ -31,8 +31,18 @@ class DatasetLogger:
 
     # ------------------------------------------------------------------
     def _ensure_header(self):
-        """Write the CSV header if the file does not exist yet."""
-        if not os.path.exists(self.filepath):
+        """Write the CSV header if the file does not exist or has wrong header."""
+        needs_header = True
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r") as f:
+                    first_line = f.readline().strip()
+                    expected = ",".join(CSV_COLUMNS)
+                    if first_line == expected:
+                        needs_header = False
+            except Exception:
+                pass
+        if needs_header:
             with open(self.filepath, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 writer.writeheader()

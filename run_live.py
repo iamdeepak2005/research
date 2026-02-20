@@ -1,37 +1,30 @@
 #!/usr/bin/env python3
 """
-run_live.py — Live real-time SDN simulation with web dashboard.
+run_live.py — SDN Simulation with dummy traffic & Dijkstra routing.
 
-Three modes:
-  --mode simulate   (default) Scripted traffic phases with random numbers
-  --mode live       Real NIC traffic captured via psutil
-  --mode discover   Auto-discovers real network topology (ARP + ping + traceroute)
-                    then monitors real NIC traffic
+Simulates MULTIPLE traffic sources creating congestion scenarios.
+Two-model architecture:
+  1. Traffic Generator Model — produces realistic congestion patterns
+     (multiple sources flooding a link, random bursts, cascade congestion)
+  2. ML Predictor Model — trained online, predicts congestion BEFORE it happens
+     and triggers Dijkstra rerouting proactively
 
 Configurable:
-  --switches N      Number of switches for simulate/live modes (default: 4)
-                    Ignored in discover mode (topology is auto-detected)
-
-Features:
-  - Web dashboard with animated network topology & packet routing
-  - Smooth Chart.js graphs with hardware-accelerated rendering
-  - Dynamic topology (N switches, N hosts, full-mesh links)
-  - ML model training & prediction timing with R²/MAE
-  - Congestion detection & reroute visualization
+  --routers N     Number of routers in the full-mesh topology (default: 4)
+  --no-gui        Disable web dashboard, terminal only
+  --port P        Web dashboard port (default: 8050)
 
 Usage:
-    python run_live.py                         # 4 switches, simulate
-    python run_live.py --switches 6            # 6 switches, simulate
-    python run_live.py --mode live             # real NIC traffic, 4 switches
-    python run_live.py --mode discover         # auto-discover real network!
-    python run_live.py --switches 5 --mode live
-    python run_live.py --no-gui                # terminal only
+    python run_live.py                    # 4 routers
+    python run_live.py --routers 6        # 6 routers
+    python run_live.py --no-gui           # terminal only
 
 Press Ctrl+C to stop at any time.
 """
 
 import time
 import random
+import math
 import sys
 import os
 import argparse
@@ -59,66 +52,175 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 
 
-def banner(n_switches):
+def banner(n_routers):
     print(f"""
 {CYAN}{BOLD}╔══════════════════════════════════════════════════════════════╗
-║  SDN Proactive Congestion Avoidance — LIVE Simulation       ║
-║  Real-time telemetry → ML prediction → Dynamic rerouting    ║
-║  Topology: {n_switches} switches, {n_switches} hosts, full mesh ({n_switches*(n_switches-1)//2} links)        ║
+║  SDN Proactive Congestion Avoidance — Multi-Source Sim      ║
+║  Traffic Generator → ML Prediction → Dijkstra Rerouting    ║
+║  Topology: {n_routers} routers, {n_routers} hosts, full mesh ({n_routers*(n_routers-1)//2} links)        ║
 ╚══════════════════════════════════════════════════════════════╝{RESET}
 """)
 
 
 # ==================================================================
-#  SIMULATED TRAFFIC
+#  TRAFFIC GENERATOR MODEL
+#  Simulates realistic multi-source congestion patterns
 # ==================================================================
-def traffic_rate(elapsed, sw, port, n_switches):
+class TrafficGenerator:
     """
-    Returns utilization fraction (0.0-1.0) based on elapsed time.
-    The s1→s2 link (s1, port 2) is the one that gets congested.
-    Other links have varied background traffic.
+    Model 1: Generates realistic traffic that causes congestion.
+    
+    Simulates multiple hosts sending data simultaneously to create
+    congestion. Models real-world scenarios:
+      - Multiple sources flooding a single link
+      - Cascade congestion (one congested link pushes traffic to another)
+      - Random burst events (sudden spikes)
+      - Gradual buildup from sustained transfers
     """
-    if sw == "s1" and port == 2:
-        # s1→s2: the congestion link
-        if elapsed < 60:
-            return random.uniform(0.15, 0.30)
-        elif elapsed < 120:
-            progress = (elapsed - 60) / 60.0
-            base = 0.30 + 0.65 * progress
-            return min(1.0, base + random.gauss(0, 0.03))
-        elif elapsed < 180:
-            return min(1.0, random.uniform(0.85, 0.97))
-        elif elapsed < 240:
-            progress = (elapsed - 180) / 60.0
-            base = 0.90 - 0.65 * progress
-            return max(0.05, base + random.gauss(0, 0.03))
-        else:
-            if random.random() < 0.15:
-                return random.uniform(0.75, 0.95)
-            return random.uniform(0.10, 0.35)
 
-    elif sw == "s2" and port == 3 and n_switches >= 3:
-        # s2→s3: moderate with slow growth
-        base = 0.10 + 0.002 * elapsed
-        return min(0.6, base + random.gauss(0, 0.03))
+    def __init__(self, n_routers):
+        self.n_routers = n_routers
+        self.active_flows = []       # Currently active traffic flows
+        self.congestion_events = []  # Scheduled congestion scenarios
+        self.packet_collisions = []  # Active collision locations
+        self._schedule_events()
 
-    elif sw == "s1" and port == 3 and n_switches >= 3:
-        # s1→s3: slightly elevated
-        return random.uniform(0.08, 0.30)
+    def _schedule_events(self):
+        """Pre-schedule congestion scenarios throughout the simulation."""
+        self.congestion_events = [
+            # (start_time, duration, type, params)
+            # Phase 1: Warm-up — light traffic on all links
+            # Phase 2: Multi-source flood — 3+ hosts targeting same link
+            {"start": 40, "duration": 50, "type": "multi_source_flood",
+             "target_link": ("s1", 2), "n_sources": 3, "peak_util": 0.95},
+            # Phase 3: Brief calm
+            # Phase 4: Cascade congestion — flooding spills to neighbors
+            {"start": 110, "duration": 40, "type": "cascade",
+             "origin_link": ("s1", 2), "spread_links": [("s2", 3)],
+             "peak_util": 0.92},
+            # Phase 5: Random burst
+            {"start": 170, "duration": 20, "type": "burst",
+             "links": [("s1", 3), ("s1", 4)], "peak_util": 0.88},
+            # Phase 6: Sustained multi-flow congestion
+            {"start": 210, "duration": 60, "type": "multi_source_flood",
+             "target_link": ("s2", 3), "n_sources": 4, "peak_util": 0.93},
+            # Phase 7: Recovery + random spikes
+            {"start": 290, "duration": 999, "type": "random_spikes",
+             "spike_chance": 0.20, "spike_duration": 15, "peak_util": 0.90},
+        ]
 
-    else:
-        # Everything else: low random
-        return random.uniform(0.05, 0.25)
+    def get_utilization(self, elapsed, sw, port):
+        """
+        Compute link utilization based on all active traffic patterns.
+        Multiple sources can stack their contributions on the same link.
+        """
+        base_util = self._background_traffic(elapsed, sw, port)
+        event_util = 0.0
+        collision = False
+
+        for event in self.congestion_events:
+            start = event["start"]
+            duration = event["duration"]
+            if elapsed < start or elapsed > start + duration:
+                continue
+
+            progress = (elapsed - start) / duration
+            etype = event["type"]
+
+            if etype == "multi_source_flood":
+                # Multiple hosts converging on target link
+                tgt_sw, tgt_port = event["target_link"]
+                if sw == tgt_sw and port == tgt_port:
+                    n_src = event["n_sources"]
+                    peak = event["peak_util"]
+                    # Ramp up → sustain → ramp down
+                    if progress < 0.2:
+                        intensity = progress / 0.2
+                    elif progress > 0.8:
+                        intensity = (1.0 - progress) / 0.2
+                    else:
+                        intensity = 1.0
+                    # Each source adds ~peak/n_sources with some noise
+                    per_source = peak / n_src
+                    event_util += sum(
+                        per_source * intensity + random.gauss(0, 0.02)
+                        for _ in range(n_src)
+                    )
+                    if event_util > UTILIZATION_THRESHOLD:
+                        collision = True
+                # Neighboring links also see elevated traffic
+                elif sw == tgt_sw:
+                    event_util += random.uniform(0.05, 0.15) * (1 - progress)
+
+            elif etype == "cascade":
+                # Congestion spreading from one link to its neighbors
+                origin_sw, origin_port = event["origin_link"]
+                peak = event["peak_util"]
+                if sw == origin_sw and port == origin_port:
+                    intensity = min(1.0, progress * 2)
+                    event_util += peak * intensity + random.gauss(0, 0.03)
+                    if event_util > UTILIZATION_THRESHOLD:
+                        collision = True
+                for spread_sw, spread_port in event["spread_links"]:
+                    if sw == spread_sw and port == spread_port:
+                        # Cascade delay
+                        delayed = max(0, progress - 0.3) / 0.7
+                        event_util += peak * 0.8 * delayed + random.gauss(0, 0.03)
+                        if event_util > 0.7:
+                            collision = True
+
+            elif etype == "burst":
+                # Sudden spike on multiple links
+                for burst_sw, burst_port in event["links"]:
+                    if sw == burst_sw and port == burst_port:
+                        peak = event["peak_util"]
+                        # Sharp spike shape
+                        spike = math.exp(-((progress - 0.5) ** 2) / 0.05) * peak
+                        event_util += spike + random.gauss(0, 0.02)
+                        if spike > UTILIZATION_THRESHOLD:
+                            collision = True
+
+            elif etype == "random_spikes":
+                # Recurring random congestion events
+                spike_chance = event["spike_chance"]
+                # Use deterministic seed per cycle for consistency
+                cycle_id = int(elapsed / 10)
+                rng = random.Random(cycle_id * 100 + port * 10 + hash(sw))
+                if rng.random() < spike_chance:
+                    spike_peak = event["peak_util"]
+                    phase = (elapsed % 15) / 15.0
+                    spike = math.sin(phase * math.pi) * spike_peak
+                    event_util += spike
+                    if spike > UTILIZATION_THRESHOLD:
+                        collision = True
+
+        total = min(1.0, max(0.0, base_util + event_util))
+        return total, collision
+
+    def _background_traffic(self, elapsed, sw, port):
+        """Low-level background traffic with slight variation."""
+        # Time-varying base with per-link personality
+        sw_idx = int(sw[1:]) - 1
+        seed = sw_idx * 100 + port
+        phase = math.sin(elapsed * 0.05 + seed * 0.7) * 0.05
+        base = 0.08 + phase + random.gauss(0, 0.02)
+        return max(0.02, min(0.30, base))
 
 
-def generate_simulated_records(elapsed, switches_ports, n_switches):
-    """Generate simulated telemetry records."""
+def generate_dummy_records(traffic_gen, elapsed, switches_ports, n_routers):
+    """Generate dummy telemetry with multi-source congestion patterns."""
     ts = now_iso()
     records = []
+    collisions = []
+
     for sw, port in switches_ports:
-        rate = traffic_rate(elapsed, sw, port, n_switches)
+        rate, has_collision = traffic_gen.get_utilization(elapsed, sw, port)
         tx_bytes = int(LINK_CAPACITY_BYTES * rate * POLL_INTERVAL)
         rx_bytes = int(tx_bytes * random.uniform(0.6, 0.9))
+
+        if has_collision:
+            collisions.append({"switch": sw, "port": port, "util": rate})
+
         records.append({
             "timestamp": ts,
             "switch_id": sw,
@@ -129,7 +231,7 @@ def generate_simulated_records(elapsed, switches_ports, n_switches):
             "rx_bytes": rx_bytes,
             "duration_sec": POLL_INTERVAL,
         })
-    return records
+    return records, collisions
 
 
 # ==================================================================
@@ -148,7 +250,8 @@ def make_bar(value, width=25):
 
 
 def print_status(cycle, elapsed, predictions, congested, reroute_active,
-                 model_status, predict_ms=0, train_ms=0, key_links=None):
+                 model_status, predict_ms=0, train_ms=0, key_links=None,
+                 collisions=None):
     print(f"\n{DIM}{'─' * 65}{RESET}")
     timing = ""
     if predict_ms > 0:
@@ -171,6 +274,11 @@ def print_status(cycle, elapsed, predictions, congested, reroute_active,
         flag = f" {RED}⚠ CONGESTED{RESET}" if (sw, port) in congested else ""
         print(f"  {label:<6} {bar} {pred:>6.1%}{flag}")
 
+    if collisions:
+        print(f"  {RED}{BOLD}💥 PACKET COLLISIONS: {len(collisions)} link(s){RESET}")
+        for c in collisions:
+            print(f"     {RED}{c['switch']}:p{c['port']} @ {c['util']:.0%}{RESET}")
+
     other_vals = [v for (s, p), v in predictions.items()
                   if (s, p) not in key_links]
     if other_vals:
@@ -184,15 +292,11 @@ def print_status(cycle, elapsed, predictions, congested, reroute_active,
 # ==================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="SDN Proactive Congestion Avoidance — Live Runner"
+        description="SDN Proactive Congestion Avoidance — Multi-Source Simulation"
     )
     parser.add_argument(
-        "--mode", choices=["simulate", "live", "discover"], default="simulate",
-        help="Traffic source: 'simulate' (random), 'live' (real NIC), or 'discover' (auto-detect network)"
-    )
-    parser.add_argument(
-        "--switches", type=int, default=4,
-        help="Number of switches in the full-mesh topology (default: 4)"
+        "--routers", "--switches", type=int, default=4, dest="routers",
+        help="Number of routers in the full-mesh topology (default: 4)"
     )
     parser.add_argument(
         "--no-gui", action="store_true",
@@ -204,30 +308,29 @@ def main():
     )
     args = parser.parse_args()
 
-    # ── Build or discover topology ──
-    if args.mode == "discover":
-        from network_discovery import NetworkDiscovery
-        disco = NetworkDiscovery(ping_timeout_ms=400, max_tracert_hops=6)
-        topo = disco.discover()
-        n_sw = topo["n_switches"]
-        mode_label = "DISCOVERED (real network)"
-    else:
-        n_sw = max(2, args.switches)
-        topo = generate_topology(n_sw)
-        mode_label = "REAL NIC TRAFFIC (psutil)" if args.mode == "live" else "SIMULATED"
+    # ── Build topology ──
+    n_routers = max(2, args.routers)
+    topo = generate_topology(n_routers)
 
     switches_ports = topo["switches_ports"]
 
-    banner(n_sw)
-    print(f"  {CYAN}Mode: {BOLD}{mode_label}{RESET}")
-    topo_type = "discovered" if topo.get("is_discovered") else "full mesh"
-    print(f"  {CYAN}Topology: {n_sw} switches, {len(topo['hosts'])} hosts, "
-          f"{len(topo['switch_links'])} links ({topo_type}){RESET}")
+    banner(n_routers)
+    print(f"  {CYAN}Mode: {BOLD}MULTI-SOURCE SIMULATION{RESET}")
+    print(f"  {CYAN}Topology: {n_routers} routers, {len(topo['hosts'])} hosts, "
+          f"{len(topo['switch_links'])} links (full mesh){RESET}")
+    print(f"  {CYAN}Routing: Dijkstra's algorithm (utilization-weighted edges){RESET}")
+    print(f"  {CYAN}Traffic: Multiple sources create congestion → ML detects → Dijkstra reroutes{RESET}")
 
-    # ── Initialize routing engine first (needed by dashboard editor) ──
+    # ── Clean previous run FIRST (before logger so header is preserved) ──
+    for f in [TELEMETRY_CSV, MODEL_PATH]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    # ── Initialize (logger creates fresh CSV with correct header) ──
     collector = TelemetryCollector()
     csv_logger = DatasetLogger()
     routing = RoutingEngine(topo_config=topo)
+    traffic_gen = TrafficGenerator(n_routers)
     predictor = None
     model_trained = False
     reroute_active = False
@@ -238,40 +341,15 @@ def main():
     dashboard = None
     if not args.no_gui:
         from web_dashboard import WebDashboard
-        dashboard = WebDashboard(port=args.port, n_switches=n_sw, routing_engine=routing)
+        dashboard = WebDashboard(port=args.port, n_switches=n_routers, routing_engine=routing)
         dashboard.start(open_browser=True)
-        if topo.get("is_discovered"):
-            dashboard.add_event(f"Network discovered — {n_sw} routers, {len(topo['hosts'])} devices")
-            # Send device info for rich labels
-            di = topo.get("device_info", {})
-            for s in di.get("switches", []):
-                dashboard.add_event(f"  Router {s['id'].upper()}: {s['ip']} ({s.get('hostname') or s.get('role')})")
-            for h in di.get("hosts", []):
-                dashboard.add_event(f"  Host {h['id'].upper()}: {h['ip']} ({h.get('hostname') or ''})")
-        else:
-            dashboard.add_event(f"Dashboard started — {n_sw}-switch topology (Dijkstra routing)")
+        dashboard.add_event(f"Dashboard started — {n_routers}-router topology (Dijkstra routing)")
+        dashboard.add_event("Traffic: Multi-source congestion simulation active")
     else:
         print(f"  {DIM}GUI disabled — terminal output only{RESET}")
 
-    # ── NIC monitor (for live or discover modes) ──
-    nic_monitor = None
-    if args.mode in ("live", "discover"):
-        from nic_monitor import NICMonitor
-        nic_monitor = NICMonitor(switches_ports=switches_ports)
-        if dashboard:
-            dashboard.add_event(f"NIC Monitor: {len(nic_monitor.nic_names)} interface(s)")
-            for nic in nic_monitor.nic_names:
-                dashboard.add_event(f"  Monitoring: {nic}")
-
-    # ── Clean previous run ──
-    for f in [TELEMETRY_CSV, MODEL_PATH]:
-        if os.path.exists(f):
-            os.remove(f)
-
-    # Default path
-    all_hosts = topo["hosts"]
+    # Default path via Dijkstra
     all_switches = topo["switches"]
-    # Source = first host IP, dest = last host IP
     src_ip = list(topo["ip_host"].keys())[0] if topo["ip_host"] else "10.0.0.1"
     dst_ip = list(topo["ip_host"].keys())[-1] if len(topo["ip_host"]) > 1 else src_ip
     first_sw = all_switches[0]
@@ -279,23 +357,25 @@ def main():
     default_path = routing.shortest_path(first_sw, last_sw) if first_sw != last_sw else [first_sw]
 
     # Key links for terminal display
-    key_links = [("s1", p) for p in range(2, n_sw + 1)]
-    if n_sw >= 3:
+    key_links = [("s1", p) for p in range(2, min(n_routers + 1, 7))]
+    if n_routers >= 3:
         key_links.append(("s2", 3))
 
-    min_train_cycles = 30
+    # Train faster with multi-source data (data is richer)
+    min_train_cycles = 20
     n_ports_per_cycle = len(switches_ports)
 
     print(f"\n  {CYAN}Polling every {POLL_INTERVAL}s | Threshold: {UTILIZATION_THRESHOLD:.0%}{RESET}")
     print(f"  Model auto-trains after {min_train_cycles} cycles "
           f"(~{min_train_cycles * POLL_INTERVAL}s)")
-    print(f"  Default path: {' → '.join(default_path)}")
+    print(f"  Default path (Dijkstra): {' → '.join(default_path)}")
+    print(f"  Congestion scenarios scheduled: multi-source flood, cascade, bursts")
     print(f"  Press Ctrl+C to stop\n")
 
     if dashboard:
-        dashboard.add_event(f"Mode: {args.mode.upper()} | Poll: {POLL_INTERVAL}s | "
-                            f"Threshold: {UTILIZATION_THRESHOLD:.0%}")
-        dashboard.add_event(f"Default path: {' → '.join(default_path)}")
+        dashboard.add_event(f"Poll: {POLL_INTERVAL}s | Threshold: {UTILIZATION_THRESHOLD:.0%}")
+        dashboard.add_event(f"Default path (Dijkstra): {' → '.join(default_path)}")
+        dashboard.add_event(f"Congestion scenarios: flood, cascade, bursts, random spikes")
 
     start_time = time.time()
     cycle = 0
@@ -309,30 +389,30 @@ def main():
             cycle += 1
             elapsed = time.time() - start_time
 
-            # ── Generate / capture telemetry ──
-            if args.mode in ("live", "discover") and nic_monitor:
-                records = nic_monitor.poll()
-            else:
-                records = generate_simulated_records(elapsed, switches_ports, n_sw)
+            # ── Generate dummy telemetry with multi-source congestion ──
+            records, collisions = generate_dummy_records(
+                traffic_gen, elapsed, switches_ports, n_routers
+            )
 
             for record in records:
                 collector.add_record(record)
                 csv_logger.log(record)
 
-            # ── NIC throughput ──
-            nic_tx_mbps = 0
-            nic_rx_mbps = 0
-            if nic_monitor:
-                rates = nic_monitor.get_raw_rates()
-                nic_tx_mbps = sum(r.get("tx_bps", 0) for r in rates.values()) / 1e6
-                nic_rx_mbps = sum(r.get("rx_bps", 0) for r in rates.values()) / 1e6
-            else:
-                total_tx = sum(r["tx_bytes"] for r in records) * 8 / POLL_INTERVAL
-                total_rx = sum(r["rx_bytes"] for r in records) * 8 / POLL_INTERVAL
-                nic_tx_mbps = total_tx / 1e6
-                nic_rx_mbps = total_rx / 1e6
+            # ── Compute throughput ──
+            total_tx = sum(r["tx_bytes"] for r in records) * 8 / POLL_INTERVAL
+            total_rx = sum(r["rx_bytes"] for r in records) * 8 / POLL_INTERVAL
+            nic_tx_mbps = total_tx / 1e6
+            nic_rx_mbps = total_rx / 1e6
 
-            # ── Auto-train model ──
+            # ── Log collision events ──
+            if collisions and dashboard:
+                for c in collisions:
+                    dashboard.add_event(
+                        f"💥 Packet collision: {c['switch']}:p{c['port']} "
+                        f"({c['util']:.0%} utilization — multiple sources)"
+                    )
+
+            # ── Auto-train model (faster with rich data) ──
             if not model_trained and cycle >= min_train_cycles:
                 train_msg = f"Auto-training ML model ({cycle * n_ports_per_cycle} records)..."
                 if dashboard:
@@ -340,37 +420,47 @@ def main():
                 print(f"  {YELLOW}{BOLD}>>> {train_msg}{RESET}")
 
                 t0 = time.time()
-                from train_model import train as train_model_fn
-                train_model_fn()
-                train_ms = (time.time() - t0) * 1000
-
-                predictor = Predictor()
-                model_trained = True
-
                 try:
-                    from train_model import load_data, engineer_features, FEATURE_COLS
-                    from sklearn.metrics import r2_score, mean_absolute_error
-                    import joblib
-                    df = load_data(TELEMETRY_CSV)
-                    df = engineer_features(df)
-                    model = joblib.load(MODEL_PATH)
-                    X = df[FEATURE_COLS].values
-                    y = df["target"].values
-                    y_pred = model.predict(X)
-                    r2_val = r2_score(y, y_pred)
-                    mae_val = mean_absolute_error(y, y_pred)
-                except Exception:
-                    pass
+                    from train_model import train as train_model_fn
+                    train_model_fn()
+                    train_ms = (time.time() - t0) * 1000
 
-                trained_msg = f"Model trained in {train_ms:.0f}ms"
-                if r2_val is not None:
-                    trained_msg += f" | R²={r2_val:.4f} | MAE={mae_val:.6f}"
+                    predictor = Predictor()
+                    model_trained = True
 
-                if dashboard:
-                    dashboard.add_event(f"✅ {trained_msg}")
-                print(f"  {GREEN}{BOLD}>>> {trained_msg}{RESET}")
+                    try:
+                        from train_model import load_data, engineer_features, FEATURE_COLS
+                        from sklearn.metrics import r2_score, mean_absolute_error
+                        import joblib
+                        df = load_data(TELEMETRY_CSV)
+                        df = engineer_features(df)
+                        model = joblib.load(MODEL_PATH)
+                        X = df[FEATURE_COLS].values
+                        y = df["target"].values
+                        y_pred = model.predict(X)
+                        r2_val = r2_score(y, y_pred)
+                        mae_val = mean_absolute_error(y, y_pred)
+                    except Exception:
+                        pass
 
-            # ── Predict & reroute ──
+                    trained_msg = f"Model trained in {train_ms:.0f}ms"
+                    if r2_val is not None:
+                        trained_msg += f" | R²={r2_val:.4f} | MAE={mae_val:.6f}"
+
+                    if dashboard:
+                        dashboard.add_event(f"✅ {trained_msg}")
+                    print(f"  {GREEN}{BOLD}>>> {trained_msg}{RESET}")
+
+                except Exception as e:
+                    train_ms = (time.time() - t0) * 1000
+                    err_msg = f"Training failed ({train_ms:.0f}ms): {str(e)[:80]}"
+                    if dashboard:
+                        dashboard.add_event(f"❌ {err_msg}")
+                    print(f"  {RED}{BOLD}>>> {err_msg}{RESET}")
+                    # Retry next cycle with more data
+                    min_train_cycles = cycle + 5
+
+            # ── Predict & reroute (Dijkstra) ──
             predictions = {}
             congested = []
 
@@ -391,23 +481,23 @@ def main():
                     active_path_list = alt_path
                     reroute_path_str = " → ".join(alt_path) if alt_path else ""
 
+                    cong_summary = ', '.join(f'{s}:p{p}' for s, p in congested)
                     if dashboard:
                         dashboard.add_event(
-                            f"🚨 CONGESTION DETECTED on "
-                            f"{', '.join(f'{s}:p{p}' for s, p in congested)}"
+                            f"🚨 CONGESTION PREDICTED on {cong_summary}"
                         )
                         for sw, port in congested:
                             dashboard.add_event(
                                 f"  ⚠ {sw}:port{port} → predicted "
-                                f"{predictions[(sw,port)]:.1%}"
+                                f"{predictions[(sw,port)]:.1%} (multiple sources)"
                             )
-                        dashboard.add_event(f"  ⤷ Rerouting via: {reroute_path_str}")
+                        dashboard.add_event(f"  ⤷ Dijkstra reroute: {reroute_path_str}")
                     else:
-                        print(f"\n  {RED}{BOLD}🚨 CONGESTION DETECTED!{RESET}")
+                        print(f"\n  {RED}{BOLD}🚨 CONGESTION PREDICTED!{RESET}")
                         for sw, port in congested:
                             print(f"     {sw}:port{port} → predicted "
                                   f"{predictions[(sw,port)]:.1%}")
-                        print(f"  {YELLOW}⤷ Rerouting via: {reroute_path_str}{RESET}")
+                        print(f"  {YELLOW}⤷ Dijkstra reroute: {reroute_path_str}{RESET}")
 
                     actions = routing.path_to_flow_actions(alt_path)
                     for a in actions:
@@ -425,8 +515,8 @@ def main():
                     default_str = " → ".join(default_path)
 
                     if dashboard:
-                        dashboard.add_event("✓ Congestion cleared!")
-                        dashboard.add_event(f"  ⤷ Restoring default: {default_str}")
+                        dashboard.add_event("✓ Congestion cleared — traffic normalized!")
+                        dashboard.add_event(f"  ⤷ Restoring default (Dijkstra): {default_str}")
                     else:
                         print(f"\n  {GREEN}{BOLD}✓ Congestion cleared!{RESET}")
                         print(f"  {GREEN}⤷ Default: {default_str}{RESET}")
@@ -449,14 +539,15 @@ def main():
                 pred_str = {f"{sw}:{port}": val
                             for (sw, port), val in predictions.items()}
                 congested_str = [[sw, port] for sw, port in congested]
-
-                # Include device info if discovered
-                device_info = topo.get("device_info")
+                collision_data = [
+                    {"switch": c["switch"], "port": c["port"], "util": round(c["util"], 3)}
+                    for c in collisions
+                ]
 
                 dashboard.update({
                     "cycle": cycle,
                     "elapsed": elapsed,
-                    "mode": args.mode,
+                    "mode": "simulate",
                     "model_status": model_status,
                     "reroute_active": reroute_active,
                     "reroute_path": reroute_path_str,
@@ -466,11 +557,11 @@ def main():
                     "mae_score": mae_val,
                     "predictions": pred_str,
                     "congested": congested_str,
+                    "collisions": collision_data,
                     "nic_tx_mbps": nic_tx_mbps,
                     "nic_rx_mbps": nic_rx_mbps,
                     "default_path": default_path,
                     "active_path": active_path_list if reroute_active else default_path,
-                    "device_info": device_info,
                 })
 
             # ── Terminal output ──
@@ -479,7 +570,7 @@ def main():
                 print_status(cycle, elapsed, predictions, congested_set,
                              reroute_active, model_status_term,
                              predict_ms=predict_ms, train_ms=train_ms,
-                             key_links=key_links)
+                             key_links=key_links, collisions=collisions)
 
             # ── Wait ──
             time.sleep(POLL_INTERVAL)
@@ -492,6 +583,7 @@ def main():
         print(f"  CSV: {TELEMETRY_CSV}")
         if model_trained:
             print(f"  Model: {MODEL_PATH}")
+        print(f"  Routing: Dijkstra's algorithm")
         print(f"{CYAN}{BOLD}{'═' * 55}{RESET}\n")
 
         if dashboard:

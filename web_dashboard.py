@@ -6,12 +6,13 @@ Serves a single-page HTML dashboard at http://localhost:8050
 with a JSON API endpoint at /api/data for live data updates.
 
 Features:
-  - Animated network topology with switches, hosts, links
-  - Packet flow animation along active path
-  - Congestion detection & reroute visualization
+  - Animated network topology with routers, hosts, links
+  - Packet flow animation along active path (Dijkstra routing)
+  - Congestion detection & Dijkstra-based reroute visualization
   - Real-time utilization charts (Chart.js)
   - Link gauges, ML metrics, event log
-  - Dynamic topology (supports N switches)
+  - Dynamic topology (supports N routers)
+  - Dummy simulated values (no real network detection)
 
 Uses ONLY Python built-ins (http.server, json, threading).
 Frontend uses Chart.js from CDN for smooth animated graphs.
@@ -60,7 +61,7 @@ class DashboardState:
         # Topology: active path, default path
         self._default_path = []
         self._active_path = []
-        self._device_info = None  # discovered device info
+        self._collisions = []  # packet collision locations
 
         # Events
         self._events = collections.deque(maxlen=50)
@@ -96,8 +97,8 @@ class DashboardState:
                 self._default_path = data["default_path"]
             if "active_path" in data:
                 self._active_path = data["active_path"]
-            if "device_info" in data and data["device_info"]:
-                self._device_info = data["device_info"]
+            if "collisions" in data:
+                self._collisions = data["collisions"]
 
             event = data.get("event")
             if event:
@@ -145,7 +146,7 @@ class DashboardState:
                 "congested": self._congested,
                 "default_path": self._default_path,
                 "active_path": self._active_path,
-                "device_info": self._device_info,
+                "collisions": self._collisions,
                 "events": list(self._events)[:25],
             }
 
@@ -327,7 +328,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SDN Congestion Avoidance — Live Dashboard &amp; Editor</title>
+<title>SDN Congestion Avoidance — Routers &amp; Dijkstra Routing</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -449,8 +450,9 @@ body::before{
       <span><span class="live-dot" id="liveDot"></span>&nbsp;<span id="statusLabel">LIVE</span></span>
       <span id="headerCycle">Cycle 0</span>
       <span id="headerElapsed">0s</span>
-      <span id="headerMode">SIMULATE</span>
-      <span id="headerSwitches">4 Switches</span>
+      <span id="headerMode">DUMMY SIM</span>
+      <span id="headerSwitches">4 Routers</span>
+      <span style="color:var(--cyan)">Dijkstra Routing</span>
     </div>
   </div>
 
@@ -466,7 +468,7 @@ body::before{
   <div class="grid-main">
     <!-- TOPOLOGY -->
     <div class="panel topo-panel">
-      <div class="panel-title"><span class="dot" style="background:var(--accent)"></span> Network Topology — Live Routing</div>
+      <div class="panel-title"><span class="dot" style="background:var(--accent)"></span> Network Topology — Dijkstra Routing (Dummy Values)</div>
       <div class="topo-canvas-wrap">
         <canvas id="topoCanvas"></canvas>
         <div class="topo-legend">
@@ -547,6 +549,8 @@ class TopologyViz {
     this.packetPhase = 0;
     this.time = 0;
     this.dpr = window.devicePixelRatio || 1;
+    this.collisions = [];        // active collision locations
+    this.collisionParticles = []; // explosion particles
 
     this.resize();
     window.addEventListener('resize', () => this.resize());
@@ -575,32 +579,66 @@ class TopologyViz {
     this.hosts = [];
     for (let i = 0; i < this.n; i++) {
       const a = (2 * Math.PI * i / this.n) - Math.PI / 2;
-      const di_sw = this.deviceInfo?.switches?.[i];
-      const di_h = this.deviceInfo?.hosts?.[i];
       this.switches.push({
         id: 's'+(i+1),
+        label: 'R'+(i+1),  // Display as Router
         x: cx + sr*Math.cos(a), y: cy + sr*Math.sin(a),
-        realIp: di_sw?.ip || '',
-        realName: di_sw?.hostname || di_sw?.role || '',
-        role: di_sw?.role || 'switch',
       });
       this.hosts.push({
         id: 'h'+(i+1),
+        label: 'H'+(i+1),
         x: cx + hr*Math.cos(a), y: cy + hr*Math.sin(a),
-        ip: di_h?.ip || '10.0.0.'+(i+1),
-        realName: di_h?.hostname || '',
+        ip: '10.0.0.'+(i+1),
       });
     }
   }
 
   setData(d) {
-    if (d.device_info) this.deviceInfo = d.device_info;
     if (d.n_switches !== this.n) { this.n = d.n_switches; this.computeLayout(); }
     this.linkUtils = d.predictions || {};
     this.congestedLinks = (d.congested || []).map(c => c[0]+':'+c[1]);
     this.defaultPath = d.default_path || [];
     this.activePath = d.active_path || [];
     this.rerouteActive = d.reroute_active || false;
+
+    // Update collisions — spawn explosion particles for new collisions
+    const newCollisions = d.collisions || [];
+    if (newCollisions.length > 0) {
+      this.collisions = newCollisions;
+      // Spawn particles for each collision
+      for (const c of newCollisions) {
+        const sw = this.switches.find(s => s.id === c.switch);
+        if (sw) {
+          // Find the link midpoint — collision happens on the link
+          const port = c.port;
+          const i1 = parseInt(c.switch.slice(1)) - 1;
+          let targetIdx = 0, p = 2;
+          for (let j = 0; j < this.n; j++) {
+            if (j === i1) continue;
+            if (p === port) { targetIdx = j; break; }
+            p++;
+          }
+          const target = this.switches[targetIdx];
+          if (target) {
+            const mx = (sw.x + target.x) / 2;
+            const my = (sw.y + target.y) / 2;
+            // Add explosion particles
+            for (let k = 0; k < 8; k++) {
+              const angle = (Math.PI * 2 * k / 8) + Math.random() * 0.3;
+              this.collisionParticles.push({
+                x: mx, y: my,
+                vx: Math.cos(angle) * (1.5 + Math.random()),
+                vy: Math.sin(angle) * (1.5 + Math.random()),
+                life: 1.0,
+                size: 2 + Math.random() * 3,
+              });
+            }
+          }
+        }
+      }
+    } else {
+      this.collisions = [];
+    }
   }
 
   getSwitchPos(id) { return this.switches.find(s => s.id === id); }
@@ -783,10 +821,10 @@ class TopologyViz {
       }
     }
 
-    // Draw switches
+    // Draw routers
     for (const sw of this.switches) {
       const congested = this.congestedLinks.some(c => c.startsWith(sw.id+':'));
-      const swW = 52, swH = 28, r = 8;
+      const swW = 56, swH = 32, r = 8;
 
       // Glow
       if (congested) {
@@ -798,7 +836,7 @@ class TopologyViz {
         ctx.shadowBlur = 10;
       }
 
-      // Box
+      // Router box
       ctx.beginPath();
       ctx.roundRect(sw.x - swW/2, sw.y - swH/2, swW, swH, r);
       ctx.fillStyle = congested ? 'rgba(239,68,68,0.15)' : 'rgba(20,25,37,0.95)';
@@ -809,32 +847,19 @@ class TopologyViz {
 
       ctx.shadowBlur = 0;
 
-      // Label
-      ctx.font = '600 11px Inter';
+      // Router label (R1, R2, ...)
+      ctx.font = '700 12px Inter';
       ctx.fillStyle = congested ? '#ef4444' : var_text;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(sw.id.toUpperCase(), sw.x, sw.y - (sw.realIp ? 4 : 0));
+      ctx.fillText(sw.label || sw.id.toUpperCase(), sw.x, sw.y - 3);
 
-      // Real IP below name
-      if (sw.realIp) {
-        ctx.font = '400 8px JetBrains Mono';
-        ctx.fillStyle = 'rgba(88,166,255,0.6)';
-        ctx.fillText(sw.realIp, sw.x, sw.y + 8);
-      }
-
-      // Role badge above switch
-      if (sw.role === 'gateway') {
-        ctx.font = '700 7px Inter';
-        ctx.fillStyle = '#06b6d4';
-        ctx.fillText('GATEWAY', sw.x, sw.y - swH/2 - 6);
-      } else if (sw.role === 'isp_router') {
-        ctx.font = '700 7px Inter';
-        ctx.fillStyle = '#a855f7';
-        ctx.fillText('ISP', sw.x, sw.y - swH/2 - 6);
-      }
+      // "ROUTER" badge below label
+      ctx.font = '600 7px JetBrains Mono';
+      ctx.fillStyle = 'rgba(88,166,255,0.5)';
+      ctx.fillText('ROUTER', sw.x, sw.y + 9);
     }
 
-    // Draw hosts
+    // Draw hosts (nodes)
     for (const host of this.hosts) {
       const radius = 16;
 
@@ -846,18 +871,11 @@ class TopologyViz {
       ctx.lineWidth = 1.5;
       ctx.stroke();
 
+      // Host label
       ctx.font = '600 10px Inter';
       ctx.fillStyle = '#22c55e';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(host.id.toUpperCase(), host.x, host.y - (host.realName ? 4 : 0));
-
-      // Real hostname above
-      if (host.realName) {
-        ctx.font = '400 7px JetBrains Mono';
-        ctx.fillStyle = 'rgba(34,197,94,0.5)';
-        const name = host.realName.length > 12 ? host.realName.slice(0,12)+'…' : host.realName;
-        ctx.fillText(name, host.x, host.y - radius - 6);
-      }
+      ctx.fillText(host.label || host.id.toUpperCase(), host.x, host.y);
 
       // IP below
       ctx.font = '400 8px JetBrains Mono';
@@ -865,14 +883,124 @@ class TopologyViz {
       ctx.fillText(host.ip, host.x, host.y + radius + 10);
     }
 
-    // Path label
+    // Path label (Dijkstra)
     if (path.length > 1) {
-      const label = this.rerouteActive ? 'REROUTE: ' : 'PATH: ';
-      const pathStr = path.join(' → ');
+      const label = this.rerouteActive ? 'DIJKSTRA REROUTE: ' : 'DIJKSTRA PATH: ';
+      const pathStr = path.map(s => 'R'+s.slice(1)).join(' → ');
       ctx.font = '600 10px JetBrains Mono';
       ctx.fillStyle = this.rerouteActive ? '#f97316' : '#3b82f6';
       ctx.textAlign = 'left'; ctx.textBaseline = 'top';
       ctx.fillText(label + pathStr, 12, 10);
+
+      // Algorithm indicator
+      ctx.font = '500 8px JetBrains Mono';
+      ctx.fillStyle = 'rgba(88,166,255,0.4)';
+      ctx.fillText('Algorithm: Dijkstra (weighted by utilization)', 12, 24);
+    }
+
+    // ═══════════════════════════════════════════════
+    // COLLISION / CRASH ANIMATION
+    // Red explosion effects when packets crash on congested links
+    // ═══════════════════════════════════════════════
+
+    // Draw collision explosions on congested link midpoints
+    for (const c of this.collisions) {
+      const sw = this.switches.find(s => s.id === c.switch);
+      if (!sw) continue;
+      const port = c.port;
+      const i1 = parseInt(c.switch.slice(1)) - 1;
+      let targetIdx = 0, p = 2;
+      for (let j = 0; j < this.n; j++) {
+        if (j === i1) continue;
+        if (p === port) { targetIdx = j; break; }
+        p++;
+      }
+      const target = this.switches[targetIdx];
+      if (!target) continue;
+
+      const mx = (sw.x + target.x) / 2;
+      const my = (sw.y + target.y) / 2;
+
+      // Pulsing red explosion glow
+      const pulse = 0.5 + 0.5 * Math.sin(this.time * 8);
+      const explodeR = 14 + 10 * pulse;
+
+      // Outer glow
+      const grd = ctx.createRadialGradient(mx, my, 0, mx, my, explodeR + 8);
+      grd.addColorStop(0, `rgba(239,68,68,${0.5 * pulse})`);
+      grd.addColorStop(0.5, `rgba(239,68,68,${0.2 * pulse})`);
+      grd.addColorStop(1, 'transparent');
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.arc(mx, my, explodeR + 8, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Inner explosion core
+      const coreGrd = ctx.createRadialGradient(mx, my, 0, mx, my, explodeR);
+      coreGrd.addColorStop(0, `rgba(255,200,50,${0.8 * pulse})`);
+      coreGrd.addColorStop(0.3, `rgba(239,68,68,${0.6 * pulse})`);
+      coreGrd.addColorStop(1, 'transparent');
+      ctx.fillStyle = coreGrd;
+      ctx.beginPath();
+      ctx.arc(mx, my, explodeR, 0, Math.PI * 2);
+      ctx.fill();
+
+      // ✕ crash symbol
+      ctx.strokeStyle = `rgba(255,100,100,${0.7 + 0.3 * pulse})`;
+      ctx.lineWidth = 2.5;
+      const cs = 6;
+      ctx.beginPath(); ctx.moveTo(mx - cs, my - cs); ctx.lineTo(mx + cs, my + cs); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(mx + cs, my - cs); ctx.lineTo(mx - cs, my + cs); ctx.stroke();
+
+      // "COLLISION" label
+      ctx.font = '700 7px JetBrains Mono';
+      ctx.fillStyle = `rgba(239,68,68,${0.7 + 0.3 * pulse})`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.fillText('COLLISION', mx, my + explodeR + 2);
+
+      // Spinning ring of debris particles
+      const nDebris = 6;
+      for (let d = 0; d < nDebris; d++) {
+        const angle = (Math.PI * 2 * d / nDebris) + this.time * 4;
+        const dr = explodeR * 0.7 + 3 * Math.sin(this.time * 12 + d);
+        const dx = mx + Math.cos(angle) * dr;
+        const dy = my + Math.sin(angle) * dr;
+        ctx.fillStyle = `rgba(255,${100 + d * 20},50,${0.6 * pulse})`;
+        ctx.beginPath();
+        ctx.arc(dx, dy, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Update and draw explosion particles
+    for (let i = this.collisionParticles.length - 1; i >= 0; i--) {
+      const p = this.collisionParticles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vx *= 0.97;
+      p.vy *= 0.97;
+      p.life -= 0.015;
+      if (p.life <= 0) {
+        this.collisionParticles.splice(i, 1);
+        continue;
+      }
+      ctx.globalAlpha = p.life;
+      ctx.fillStyle = `rgb(239, ${Math.floor(68 + 180 * (1 - p.life))}, 68)`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1.0;
+
+    // Collision counter in top-right
+    if (this.collisions.length > 0) {
+      ctx.font = '700 11px JetBrains Mono';
+      ctx.fillStyle = '#ef4444';
+      ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+      ctx.fillText('💥 ' + this.collisions.length + ' COLLISION' + (this.collisions.length > 1 ? 'S' : ''), w - 12, 10);
+      ctx.font = '500 8px JetBrains Mono';
+      ctx.fillStyle = 'rgba(239,68,68,0.6)';
+      ctx.fillText('Multiple sources flooding links', w - 12, 24);
     }
   }
 }
@@ -954,8 +1082,8 @@ async function poll() {
     document.getElementById('headerCycle').textContent = 'Cycle ' + d.cycle;
     const m = Math.floor(d.elapsed/60), s = Math.floor(d.elapsed%60);
     document.getElementById('headerElapsed').textContent = m+'m '+s+'s';
-    document.getElementById('headerMode').textContent = d.mode.toUpperCase();
-    document.getElementById('headerSwitches').textContent = d.n_switches + ' Switches';
+    document.getElementById('headerMode').textContent = 'DUMMY SIM';
+    document.getElementById('headerSwitches').textContent = d.n_switches + ' Routers';
 
     const dot = document.getElementById('liveDot');
     const label = document.getElementById('statusLabel');
