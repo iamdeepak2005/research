@@ -84,3 +84,63 @@ def bytes_to_utilization(byte_count, duration_sec, capacity=LINK_CAPACITY_BYTES)
         return 0.0
     rate = byte_count / duration_sec  # bytes/sec
     return min(rate / capacity, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic topology generator
+# ---------------------------------------------------------------------------
+def generate_topology(n_switches=4):
+    """
+    Generate a full-mesh SDN topology with N switches and N hosts.
+
+    Returns dict with:
+        switches       — ["s1", "s2", ...]
+        hosts          — ["h1", "h2", ...]
+        switch_links   — {("s1","s2"), ("s1","s3"), ...}
+        host_switch    — {"h1": "s1", ...}
+        ip_host        — {"10.0.0.1": "h1", ...}
+        port_to_neighbor — {("s1",1): "h1", ("s1",2): "s2", ...}
+        switches_ports — [("s1",1), ("s1",2), ...]
+    """
+    switches = [f"s{i+1}" for i in range(n_switches)]
+    hosts = [f"h{i+1}" for i in range(n_switches)]
+
+    # Full mesh between all switches
+    switch_links = set()
+    for i in range(n_switches):
+        for j in range(i + 1, n_switches):
+            switch_links.add((switches[i], switches[j]))
+
+    # Host ↔ switch mapping
+    host_switch = {h: s for h, s in zip(hosts, switches)}
+
+    # IP ↔ host mapping
+    ip_host = {f"10.0.0.{i+1}": h for i, h in enumerate(hosts)}
+
+    # Port-to-neighbor: port 1 = host, ports 2+ = other switches in order
+    port_to_neighbor = {}
+    for i, sw in enumerate(switches):
+        port_to_neighbor[(sw, 1)] = hosts[i]
+        port = 2
+        for j, other in enumerate(switches):
+            if i != j:
+                port_to_neighbor[(sw, port)] = other
+                port += 1
+
+    # All (switch, port) pairs
+    n_ports = n_switches  # 1 host port + (n-1) switch ports
+    switches_ports = []
+    for sw in switches:
+        for p in range(1, n_ports + 1):
+            switches_ports.append((sw, p))
+
+    return {
+        "switches": switches,
+        "hosts": hosts,
+        "switch_links": switch_links,
+        "host_switch": host_switch,
+        "ip_host": ip_host,
+        "port_to_neighbor": port_to_neighbor,
+        "switches_ports": switches_ports,
+        "n_switches": n_switches,
+    }
